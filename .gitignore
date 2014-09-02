@@ -10,3 +10,19 @@
 
 # virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
 hs_err_pid*
+
+.gradle
+build/
+# Ignore Gradle GUI config
+gradle-app.setting
+
+# ignore remaining Gradle files
+gradlew
+gradlew.bat
+local.properties
+gradle/
+app/build/
+
+# IntelliJ
+*.iml
+.idea
