@@ -19,6 +19,14 @@ android {
     }
 }
 
+repositories {
+    mavenCentral()
+    maven {
+        url 'https://oss.sonatype.org/content/repositories/releases'
+    }
+}
+
 dependencies {
     compile fileTree(dir: 'libs', include: ['*.jar'])
+    compile group: 'org.igniterealtime.smack', name: 'smack-core', version: '4.+'
 }
