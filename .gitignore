@@ -22,7 +22,3 @@ gradlew.bat
 local.properties
 gradle/
 app/build/
-
-# IntelliJ
-*.iml
-.idea
