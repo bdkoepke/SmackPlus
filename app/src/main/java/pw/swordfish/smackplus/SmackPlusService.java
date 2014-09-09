@@ -23,6 +23,8 @@ import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 
+import static pw.swordfish.util.Unsafe.cast;
+
 public class SmackPlusService extends Service {
     public static final String ACTION_INCOMING_SMS = SmackPlusService.class.getPackage().getName() + ".INCOMING_SMS";
     private static final int VOICE_INCOMING_SMS = 10;
@@ -37,12 +39,13 @@ public class SmackPlusService extends Service {
             // refresh inbox if connectivity returns
             if (intent.getBooleanExtra(ConnectivityManager.EXTRA_NO_CONNECTIVITY, false))
                 return;
-            ConnectivityManager connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            ConnectivityManager connectivityManager = cast(getSystemService(Context.CONNECTIVITY_SERVICE));
             NetworkInfo activeNetworkInfo = connectivityManager.getActiveNetworkInfo();
             if (activeNetworkInfo != null)
                 startRefresh();
         }
     };
+    private String serverName, username, password;
     private ISms smsTransport;
     private XMPPClient client;
 
@@ -88,16 +91,15 @@ public class SmackPlusService extends Service {
      * Hook into the sms manager in order to be able to synthesize SMS events.
      * New messages from jabber will get mocked out as real SMS events in Android.
      */
-    private void registerSmsMiddleware() {
-        if (smsTransport != null)
-            return;
+    private ISms getSmsMiddleware() {
         try {
             Class serviceManager = Class.forName("android.os.ServiceManager");
             @SuppressWarnings("unchecked")
             Method getService = serviceManager.getMethod("getService", String.class);
-            smsTransport = ISms.Stub.asInterface((IBinder) getService.invoke(null, "isms"));
+            return ISms.Stub.asInterface((IBinder) getService.invoke(null, "isms"));
         } catch (ClassNotFoundException | NoSuchMethodException | InvocationTargetException | IllegalAccessException e) {
             e("register error", e);
+            return null;
         }
     }
 
@@ -111,23 +113,20 @@ public class SmackPlusService extends Service {
     public void onCreate() {
         super.onCreate();
 
-        registerSmsMiddleware();
+        if (smsTransport == null)
+            smsTransport = getSmsMiddleware();
 
-        try {
-            registerXmppClient();
-        } catch (XMPPException.ConnectException ignore) {
-            throw new RuntimeException("Failed to register xmpp client");
-        }
+        if (client == null)
+            try {
+                client = XMPPClient.connect(serverName, username, password);
+            } catch (XMPPException.ConnectException e) {
+                e("register error", e);
+            }
 
         IntentFilter filter = new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION);
         registerReceiver(mConnectivityReceiver, filter);
 
         startRefresh();
-    }
-
-    private void registerXmppClient() throws XMPPException.ConnectException {
-        if (client == null)
-            client = XMPPClient.connect("s.ms", "username", "password");
     }
 
     /**
@@ -172,6 +171,38 @@ public class SmackPlusService extends Service {
     }
 
     /**
+     * Mark all sent intents as failures.
+     */
+    public void fail(Iterable<PendingIntent> sentIntents) {
+        if (sentIntents == null)
+            return;
+        for (PendingIntent intent : sentIntents) {
+            if (intent == null)
+                continue;
+            try {
+                intent.send();
+            } catch (PendingIntent.CanceledException ignored) {
+            }
+        }
+    }
+
+    /**
+     * Mark all sent intents as successfully sent
+     */
+    public void success(Iterable<PendingIntent> sentIntents) {
+        if (sentIntents == null)
+            return;
+        for (PendingIntent intent : sentIntents) {
+            if (intent == null)
+                continue;
+            try {
+                intent.send(Activity.RESULT_OK);
+            } catch (PendingIntent.CanceledException ignored) {
+            }
+        }
+    }
+
+    /**
      * Send an outgoing sms event via jabber
      */
     public void onSendMultiPartText(String destAddr, String scAddr, List<String> texts, final List<PendingIntent> sentIntents, final List<PendingIntent> deliveryIntents, boolean multipart) {
@@ -186,34 +217,10 @@ public class SmackPlusService extends Service {
         }
     }
 
-    public void fail(Iterable<PendingIntent> sentIntents) {
-        if (sentIntents == null)
-            return;
-        for (PendingIntent intent : sentIntents) {
-            if (intent == null)
-                continue;
-            try {
-                intent.send();
-            } catch (PendingIntent.CanceledException ignored) {
-            }
-        }
-    }
-
-    public void success(Iterable<PendingIntent> sentIntents) {
-        if (sentIntents == null)
-            return;
-        for (PendingIntent intent : sentIntents) {
-            if (intent == null)
-                continue;
-            try {
-                intent.send(Activity.RESULT_OK);
-            } catch (PendingIntent.CanceledException ignored) {
-            }
-        }
-    }
-
     void refreshMessages() {
-        throw new RuntimeException("Not implemented");
+        // TODO: implement refreshing messages from the server...
+        e("refreshing messages", null);
+        ///throw new RuntimeException("Not implemented");
     }
 
     void startRefresh() {
@@ -225,17 +232,15 @@ public class SmackPlusService extends Service {
         }.start();
     }
 
-    // insert a message into the sms/mms provider.
-    // we do this in the case of outgoing messages
-    // that were not sent via this phone, and also on initial
-    // message sync.
+    /**
+     * insert a message into the sms/mms provider.
+     * we do this in the case of outgoing messages
+     * that were not sent via this phone, and also on initial
+     * message sync.
+     */
     @TargetApi(Build.VERSION_CODES.KITKAT)
     synchronized void insertMessage(String number, String text, int type, long date) {
-        Uri uri;
-        if (type == PROVIDER_INCOMING_SMS)
-            uri = URI_RECEIVED;
-        else
-            uri = URI_SENT;
+        Uri uri = type == PROVIDER_INCOMING_SMS ? URI_RECEIVED : URI_SENT;
 
         try (Cursor c = getContentResolver().query(uri, null, "date = ?",
                 new String[]{String.valueOf(date)}, null)) {
