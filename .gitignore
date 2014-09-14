@@ -22,3 +22,6 @@ gradlew.bat
 local.properties
 gradle/
 app/build/
+
+# JetBrains
+.idea

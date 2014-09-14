@@ -1,73 +1,88 @@
 package pw.swordfish.smackplus;
 
-import android.annotation.TargetApi;
-import android.app.Activity;
 import android.app.PendingIntent;
 import android.app.Service;
-import android.content.*;
+import android.content.BroadcastReceiver;
+import android.content.ComponentName;
+import android.content.ContentValues;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.database.Cursor;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
-import android.net.Uri;
-import android.os.Build;
 import android.os.IBinder;
 import android.provider.Settings;
 import android.text.TextUtils;
 import android.util.Log;
-import com.android.internal.telephony.ISms;
-import pw.swordfish.xmpp.XMPPClient;
-import pw.swordfish.xmpp.XMPPException;
 
-import java.lang.reflect.InvocationTargetException;
+import com.android.internal.telephony.ISms;
+
+import org.jivesoftware.smack.filter.PacketFilter;
+import org.jivesoftware.smack.packet.Message;
+import org.jivesoftware.smack.packet.Packet;
+
 import java.lang.reflect.Method;
 import java.util.ArrayList;
-import java.util.List;
+import java.util.Date;
+
+import pw.swordfish.rx.Observer;
+import pw.swordfish.sms.Transceiver;
+import pw.swordfish.util.function.Supplier;
+import pw.swordfish.util.function.Suppliers;
+import pw.swordfish.xmpp.ConnectException;
+import pw.swordfish.xmpp.XmppTransceiver;
 
 import static pw.swordfish.util.Unsafe.cast;
 
 public class SmackPlusService extends Service {
-    public static final String ACTION_INCOMING_SMS = SmackPlusService.class.getPackage().getName() + ".INCOMING_SMS";
-    private static final int VOICE_INCOMING_SMS = 10;
-    private static final int VOICE_OUTGOING_SMS = 11;
-    private static final int PROVIDER_INCOMING_SMS = 1;
-    private static final int PROVIDER_OUTGOING_SMS = 2;
-    private static final Uri URI_SENT = Uri.parse("content://sms/sent");
-    private static final Uri URI_RECEIVED = Uri.parse("content://sms/inbox");
-    BroadcastReceiver mConnectivityReceiver = new BroadcastReceiver() {
+    public static final String ACTION_INCOMING_SMS = SmackPlusService.class.getPackage().getName() + ".INCOMING_VOICE";
+    public static final String ACCOUNT_CHANGED = SmackPlusService.class.getPackage().getName() + ".ACCOUNT_CHANGED";
+
+    private static final String LOGTAG = SmackPlusService.class.getName();
+
+    /* ensure that this notification listener is enabled.
+     * the service watches for google voice notifications to know when to check for new
+     * messages. */
+    private final BroadcastReceiver mConnectivityReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
             // refresh inbox if connectivity returns
             if (intent.getBooleanExtra(ConnectivityManager.EXTRA_NO_CONNECTIVITY, false))
                 return;
-            ConnectivityManager connectivityManager = cast(getSystemService(Context.CONNECTIVITY_SERVICE));
+            ConnectivityManager connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
             NetworkInfo activeNetworkInfo = connectivityManager.getActiveNetworkInfo();
-            if (activeNetworkInfo != null)
-                startRefresh();
+            if (activeNetworkInfo != null) {
+                // TODO: should do something...
+                Log.i(LOGTAG, "Network is available, should be reconnecting...");
+            }
         }
     };
-    private String serverName, username, password;
-    private ISms smsTransport;
-    private XMPPClient client;
+    /* hook into sms manager to be able to synthesize SMS events.
+     * new messages from smack plus get mocked out as real SMS events in Android. */
+    private final Supplier<ISms> smsTransport = Suppliers.memoize(new Supplier<ISms>() {
+        @Override
+        public ISms get() {
+            try {
+                Class sm = Class.forName("android.os.ServiceManager");
+                @SuppressWarnings("unchecked") Method getService = sm.getMethod("getService", String.class);
+                return ISms.Stub.asInterface((IBinder) getService.invoke(null, "isms"));
+            } catch (Exception e) {
+                Log.e(LOGTAG, "register error", e);
+                return null;
+            }
+        }
+    });
+    private Transceiver transceiver;
 
-    private static void e(String message, Exception e) {
-        Log.e("SmackPlusService", message, e);
-    }
 
     @Override
     public IBinder onBind(Intent intent) {
         return null;
     }
 
-    /**
-     * Ensure that this notification listener is enabled.
-     * The service watches for jabber notifications to know when to check for new
-     * messages.
-     */
-    @TargetApi(Build.VERSION_CODES.CUPCAKE)
     private void ensureEnabled() {
-        //Settings.Secure.ENABLED_NOTIFICATION_LISTENERS
         final String ENABLED_NOTIFICATION_LISTENERS = "enabled_notification_listeners";
-
         ComponentName me = new ComponentName(this, SmackListenerService.class);
         String meFlattened = me.flattenToString();
 
@@ -87,22 +102,6 @@ public class SmackPlusService extends Service {
                 existingListeners);
     }
 
-    /**
-     * Hook into the sms manager in order to be able to synthesize SMS events.
-     * New messages from jabber will get mocked out as real SMS events in Android.
-     */
-    private ISms getSmsMiddleware() {
-        try {
-            Class serviceManager = Class.forName("android.os.ServiceManager");
-            @SuppressWarnings("unchecked")
-            Method getService = serviceManager.getMethod("getService", String.class);
-            return ISms.Stub.asInterface((IBinder) getService.invoke(null, "isms"));
-        } catch (ClassNotFoundException | NoSuchMethodException | InvocationTargetException | IllegalAccessException e) {
-            e("register error", e);
-            return null;
-        }
-    }
-
     @Override
     public void onDestroy() {
         super.onDestroy();
@@ -113,153 +112,136 @@ public class SmackPlusService extends Service {
     public void onCreate() {
         super.onCreate();
 
-        if (smsTransport == null)
-            smsTransport = getSmsMiddleware();
-
-        if (client == null)
-            try {
-                client = XMPPClient.connect(serverName, username, password);
-            } catch (XMPPException.ConnectException e) {
-                e("register error", e);
-            }
+        //SharedPreferences settings = getSharedPreferences("settings", MODE_PRIVATE);
+        try {
+            transceiver = XmppTransceiver.connect("s.ms", "2508784414", "TkynmSR2nqz3ooq", new PacketFilter() {
+                @Override
+                public boolean accept(Packet packet) {
+                    if (! (packet instanceof Message))
+                        return false;
+                    Message message = cast(packet);
+                    return ! message.getBody().startsWith("(SMSSERVICE)");
+                }
+            });
+        } catch (ConnectException e) {
+            Log.e(LOGTAG, "Could not connect", e);
+        }
 
         IntentFilter filter = new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION);
         registerReceiver(mConnectivityReceiver, filter);
 
-        startRefresh();
+        Log.i(LOGTAG, "Subscribing new observer to the incoming sms transceiver");
+        // TODO: fix memory leak...
+        transceiver.subscribe(new Observer<pw.swordfish.sms.Message>() {
+            @Override
+            public void onCompleted() {
+                Log.i(LOGTAG, "closing observer");
+            }
+
+            @Override
+            public void onError(Exception error) {
+            }
+
+            @Override
+            public void onNext(pw.swordfish.sms.Message value) {
+                insertMessage(value.getAddress(), value.getBody(), ProviderSms.INCOMING, value.getTimestamp());
+                synthesizeMessage(value.getAddress(), value.getBody(), value.getTimestamp());
+            }
+        });
     }
 
-    /**
-     * Parse out the intent extras from android.intent.action.NEW_OUTGOING_SMS
-     * and send it off via jabber
-     */
-    void handleOutgoingSms(Intent intent) {
-        boolean multipart = intent.getBooleanExtra("multipart", false);
+    /* parse out the intent extras from android.intent.action.NEW_OUTGOING_SMS
+     * and send it off via xmpp */
+    private void handleOutgoingSms(Intent intent) {
+        /* boolean multipart = intent.getBooleanExtra("multipart", false);
+         String scAddr = intent.getStringExtra("scAddr");
+         ArrayList<PendingIntent> deliveryIntents = intent.getParcelableArrayListExtra("deliveryIntents"); */
+
         String destAddr = intent.getStringExtra("destAddr");
-        String scAddr = intent.getStringExtra("scAddr");
-        List<String> parts = intent.getStringArrayListExtra("parts");
-        List<PendingIntent> sentIntents = intent.getParcelableArrayListExtra("sentIntents");
-        List<PendingIntent> deliveryIntents = intent.getParcelableArrayListExtra("deliveryIntents");
+        ArrayList<String> parts = intent.getStringArrayListExtra("parts");
+        ArrayList<PendingIntent> sentIntents = intent.getParcelableArrayListExtra("sentIntents");
 
-        onSendMultiPartText(destAddr, scAddr, parts, sentIntents, deliveryIntents, multipart);
+        onSendText(destAddr, parts, sentIntents);
     }
 
-    @TargetApi(Build.VERSION_CODES.ECLAIR)
     @Override
     public int onStartCommand(final Intent intent, int flags, int startId) {
         int startContinuationMask = super.onStartCommand(intent, flags, startId);
 
-        // TODO: add support for account settings
-
-        ensureEnabled();
-
+        // TODO: get account info...
         if (intent == null)
             return startContinuationMask;
 
+        ensureEnabled();
+
         // handle an outgoing sms on a background thread.
-        if ("android.intent.action.NEW_OUTGOING_SMS".equals(intent.getAction()))
+        if ("android.intent.action.NEW_OUTGOING_SMS".equals(intent.getAction())) {
             new Thread() {
                 @Override
                 public void run() {
                     handleOutgoingSms(intent);
                 }
             }.start();
-        else if (ACTION_INCOMING_SMS.equals(intent.getAction()))
-            startRefresh();
+        } else if (ACTION_INCOMING_SMS.equals(intent.getAction())) {
+            return startContinuationMask;
 
+        }
         return startContinuationMask;
     }
 
-    /**
-     * Mark all sent intents as failures.
-     */
-    public void fail(Iterable<PendingIntent> sentIntents) {
+    private static void markIntents(Iterable<PendingIntent> sentIntents, ActivityResult result) {
         if (sentIntents == null)
             return;
-        for (PendingIntent intent : sentIntents) {
-            if (intent == null)
+        for (PendingIntent sentIntent : sentIntents) {
+            if (sentIntent == null)
                 continue;
             try {
-                intent.send();
-            } catch (PendingIntent.CanceledException ignored) {
-            }
+                sentIntent.send(result.getCode());
+            } catch (Exception ignored) {}
         }
     }
 
-    /**
-     * Mark all sent intents as successfully sent
-     */
-    public void success(Iterable<PendingIntent> sentIntents) {
-        if (sentIntents == null)
-            return;
-        for (PendingIntent intent : sentIntents) {
-            if (intent == null)
-                continue;
-            try {
-                intent.send(Activity.RESULT_OK);
-            } catch (PendingIntent.CanceledException ignored) {
-            }
-        }
+    private static String join(Iterable<String> sequences) {
+        StringBuilder join = new StringBuilder();
+        for (String sequence : sequences)
+            join.append(sequence);
+        return join.toString();
     }
 
-    /**
-     * Send an outgoing sms event via jabber
-     */
-    public void onSendMultiPartText(String destAddr, String scAddr, List<String> texts, final List<PendingIntent> sentIntents, final List<PendingIntent> deliveryIntents, boolean multipart) {
-        StringBuilder textBuilder = new StringBuilder();
-        for (String text : texts)
-            textBuilder.append(text);
+    /* sent an outgoing message via xmpp */
+    private void onSendText(String address, Iterable<String> texts, final Iterable<PendingIntent> sentIntents) {
         try {
-            client.sendText(destAddr, textBuilder.toString());
-            success(sentIntents);
-        } catch (XMPPException.NotConnectedException e) {
-            fail(sentIntents);
+            transceiver.send(pw.swordfish.sms.Message.createMessage(address, join(texts), new Date().getTime()));
+            markIntents(sentIntents, ActivityResult.RESULT_OK);
+        } catch (Exception e) {
+            Log.d(LOGTAG, "send error", e);
+            markIntents(sentIntents, ActivityResult.RESULT_CANCELED);
         }
     }
 
-    void refreshMessages() {
-        // TODO: implement refreshing messages from the server...
-        e("refreshing messages", null);
-        ///throw new RuntimeException("Not implemented");
-    }
-
-    void startRefresh() {
-        new Thread() {
-            @Override
-            public void run() {
-                refreshMessages();
-            }
-        }.start();
-    }
-
-    /**
-     * insert a message into the sms/mms provider.
+    /* insert a message into the sms/mms provider.
      * we do this in the case of outgoing messages
      * that were not sent via this phone, and also on initial
-     * message sync.
-     */
-    @TargetApi(Build.VERSION_CODES.KITKAT)
-    synchronized void insertMessage(String number, String text, int type, long date) {
-        Uri uri = type == PROVIDER_INCOMING_SMS ? URI_RECEIVED : URI_SENT;
-
-        try (Cursor c = getContentResolver().query(uri, null, "date = ?",
+     * message sync. */
+    private synchronized void insertMessage(String number, String text, ProviderSms provider, long date) {
+        try (Cursor c = getContentResolver().query(provider.getUri(), null, "date = ?",
                 new String[]{String.valueOf(date)}, null)) {
             if (c.moveToNext())
                 return;
         }
+
         ContentValues values = new ContentValues();
         values.put("address", number);
         values.put("body", text);
-        values.put("type", type);
+        values.put("type", provider.getType());
         values.put("date", date);
         values.put("date_sent", date);
         values.put("read", 1);
-        getContentResolver().insert(uri, values);
+        getContentResolver().insert(provider.getUri(), values);
     }
 
-    @TargetApi(Build.VERSION_CODES.KITKAT)
     synchronized void synthesizeMessage(String number, String message, long date) {
-        try (Cursor c = getContentResolver().query(URI_RECEIVED, null, "date = ?",
+        try (Cursor c = getContentResolver().query(ProviderSms.INCOMING.getUri(), null, "date = ?",
                 new String[]{String.valueOf(date)}, null)) {
             if (c.moveToNext())
                 return;
@@ -269,9 +251,9 @@ public class SmackPlusService extends Service {
         list.add(message);
         try {
             // synthesize a BROADCAST_SMS event
-            smsTransport.synthesizeMessages(number, null, list, date);
+            smsTransport.get().synthesizeMessages(number, null, list, date);
         } catch (Exception e) {
-            e("Error synthesizing SMS messages", e);
+            Log.e(LOGTAG, "Error synthesizing SMS messages", e);
         }
     }
 }
